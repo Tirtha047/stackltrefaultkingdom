@@ -1,0 +1,1598 @@
+StackIt - Complete Production-Ready Flask App with Real-time & AI Features
+===========================================================================
+
+Below is the complete codebase for the "StackIt" Q&A platform with all requested features.  
+The chosen UI theme is the first palette: Neon Cyberpunk (Glowing cyan #00F5FF, matte black #0A0A14 background, pink #FF00E4 accents), styled dark mode with glowing cyberpunk aesthetic.
+
+====================
+Project Structure
+====================
+
+stackit/
+│
+├── app.py                     # Flask app entrypoint
+├── config.py                  # Configuration including secret keys and db
+├── models.py                  # SQLAlchemy models/database schema
+├── requirements.txt           # Required Python packages
+├── run.py                     # Run script to start Flask with SocketIO
+│
+├── static/
+│   ├── css/
+│   │   └── style.css          # Main CSS with neon cyberpunk styling + dark mode
+│   ├── js/
+│   │   ├── main.js            # Main frontend JS (ES6+)
+│   │   ├── socketio-client.js # Socket.IO related JS for realtime features
+│   │   └── speech.js          # Voice-to-text handling JS using Web Speech API
+│   ├── vendor/
+│   │   ├── highlight.min.js   # Syntax highlighting lib Highlight.js
+│   │   └── highlight.min.css
+│   └── fonts/                 # Optional: neon fonts if desired (can use Google Fonts CDN)
+│
+├── templates/
+│   ├── base.html              # Base layout with nav/dark mode toggle/tooltips etc.
+│   ├── index.html             # Home showing questions feed + ask question button
+│   ├── login.html             # Login form
+│   ├── register.html          # Registration form
+│   ├── question.html          # Question detail + answers + answer editor
+│   ├── profile.html           # User profile and badges
+│   └── help_tooltip.html      # Contextual help tooltips partial for new users
+│
+└── demo_data.py               # Script to insert demo data and badges for presentation
+
+====================
+Setup & Deployment
+====================
+
+1. Install Python 3.9+ and pip
+
+2. Create and activate a virtual environment:
+
+   python3 -m venv venv
+   source venv/bin/activate   (Linux/macOS)
+   venv\Scripts\activate      (Windows)
+
+3. Install dependencies:
+
+   pip install -r requirements.txt
+
+4. Initialize DB and insert demo data:
+
+   flask shell
+   >>> from app import db
+   >>> db.create_all()
+   >>> exit()
+   python demo_data.py
+
+5. Run the application (development mode):
+
+   python run.py
+
+6. Open http://localhost:5000/ in a modern browser (preferably Chrome preferred for Web Speech API)
+
+====================
+Key Features Overview
+====================
+
+- User auth with Flask-Login
+- Question ask with AI auto-tagging (keyword matching)
+- Real-time "Did you mean?" duplicate question suggestions (SocketIO)
+- Live collaborative answer editing using Socket.IO rooms
+- Voice-to-text question input via Web Speech API
+- Dynamic expert badges awarded for activity milestones
+- Anonymous posting option per question/answer
+- Code syntax highlighting and live code previews in answers (Highlight.js)
+- Dark mode toggle with neon cyberpunk palette
+- Contextual help tooltips for new users (managed via JS on first visit)
+- Community fact-check system (users can flag/correct answers)
+
+====================
+Below: All code files inline by name for copy-paste
+====================
+
+===== requirements.txt =====
+Flask==2.3.2
+Flask-SQLAlchemy==3.0.3
+Flask-Login==0.6.2
+Flask-WTF==1.1.1
+Flask-SocketIO==5.3.2
+eventlet==0.33.3
+WTForms==3.0.1
+email-validator==1.3.1
+
+===== config.py =====
+import os
+
+class Config:
+    SECRET_KEY = os.environ.get('SECRET_KEY', 'supersecretkeychangeinprod')
+    SQLALCHEMY_DATABASE_URI = 'sqlite:///stackit.db'
+    SQLALCHEMY_TRACK_MODIFICATIONS = False
+    SOCKETIO_MESSAGE_QUEUE = None  # can add Redis URL if scaling web sockets
+
+===== models.py =====
+from flask_sqlalchemy import SQLAlchemy
+from flask_login import UserMixin
+from datetime import datetime
+from werkzeug.security import generate_password_hash, check_password_hash
+
+db = SQLAlchemy()
+
+tags_questions = db.Table('tags_questions',
+    db.Column('tag_id', db.Integer, db.ForeignKey('tags.id'), primary_key=True),
+    db.Column('question_id', db.Integer, db.ForeignKey('questions.id'), primary_key=True)
+)
+
+class User(db.Model, UserMixin):
+    __tablename__ = 'users'
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(30), unique=True, index=True, nullable=False)
+    email = db.Column(db.String(120), unique=True, index=True, nullable=False)
+    password_hash = db.Column(db.String(128), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    questions = db.relationship('Question', backref='author', lazy='dynamic')
+    answers = db.relationship('Answer', backref='author', lazy='dynamic')
+    votes = db.relationship('Vote', backref='voter', lazy='dynamic')
+    badges = db.relationship('Badge', backref='user', lazy='dynamic')
+
+    def set_password(self, password):
+        self.password_hash = generate_password_hash(password)
+
+    def check_password(self, password):
+        return check_password_hash(self.password_hash, password)
+
+    def is_expert(self):
+        # Heuristic for expert badge: >= 10 accepted answers or 50 votes cast
+        accepted_answers = sum(1 for a in self.answers if a.is_accepted)
+        votes_cast = self.votes.count()
+        return accepted_answers >= 10 or votes_cast >= 50
+
+class Question(db.Model):
+    __tablename__ = 'questions'
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(140), nullable=False, index=True)
+    description = db.Column(db.Text, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    tags = db.relationship('Tag', secondary=tags_questions, backref='questions')
+    answers = db.relationship('Answer', backref='question', lazy='dynamic', cascade='all,delete')
+    anonymous = db.Column(db.Boolean, default=False)
+    votes = db.relationship('Vote', backref='question', lazy='dynamic', cascade='all,delete')
+
+    def vote_score(self):
+        up = sum(1 for v in self.votes if v.is_upvote)
+        down = sum(1 for v in self.votes if not v.is_upvote)
+        return up - down
+
+class Answer(db.Model):
+    __tablename__ = 'answers'
+    id = db.Column(db.Integer, primary_key=True)
+    content = db.Column(db.Text, nullable=False)  # stored as sanitized HTML (rich text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    question_id = db.Column(db.Integer, db.ForeignKey('questions.id'))
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    votes = db.relationship('Vote', backref='answer', lazy='dynamic', cascade='all,delete')
+    is_accepted = db.Column(db.Boolean, default=False)
+    anonymous = db.Column(db.Boolean, default=False)
+
+    def vote_score(self):
+        up = sum(1 for v in self.votes if v.is_upvote)
+        down = sum(1 for v in self.votes if not v.is_upvote)
+        return up - down
+
+class Vote(db.Model):
+    __tablename__ = 'votes'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    question_id = db.Column(db.Integer, db.ForeignKey('questions.id'), nullable=True)
+    answer_id = db.Column(db.Integer, db.ForeignKey('answers.id'), nullable=True)
+    is_upvote = db.Column(db.Boolean, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'question_id', name='unique_user_question_vote'),
+        db.UniqueConstraint('user_id', 'answer_id', name='unique_user_answer_vote'),
+    )
+
+class Tag(db.Model):
+    __tablename__ = 'tags'
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(30), unique=True, nullable=False, index=True)
+
+class Badge(db.Model):
+    __tablename__ = 'badges'
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    name = db.Column(db.String(50), nullable=False)
+    description = db.Column(db.String(200), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+class FactCheck(db.Model):
+    __tablename__ = 'factchecks'
+    id = db.Column(db.Integer, primary_key=True)
+    answer_id = db.Column(db.Integer, db.ForeignKey('answers.id'))
+    user_id = db.Column(db.Integer, db.ForeignKey('users.id'))
+    comment = db.Column(db.Text, nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+===== app.py =====
+from flask import Flask, render_template, redirect, url_for, flash, request, jsonify, session
+from flask_login import LoginManager, login_user, logout_user, current_user, login_required
+from flask_socketio import SocketIO, join_room, leave_room, emit
+from models import db, User, Question, Answer, Vote, Tag, Badge, FactCheck
+from config import Config
+from werkzeug.utils import secure_filename
+from flask_wtf import FlaskForm
+from wtforms import StringField, PasswordField, TextAreaField, BooleanField, SubmitField, SelectMultipleField
+from wtforms.validators import DataRequired, Length, Email, EqualTo, Optional
+import re
+import eventlet
+eventlet.monkey_patch()
+
+import bleach
+
+app = Flask(__name__)
+app.config.from_object(Config)
+db.init_app(app)
+
+login_manager = LoginManager()
+login_manager.init_app(app)
+login_manager.login_view = 'login'
+
+socketio = SocketIO(app, async_mode='eventlet')
+
+CLEAN_TAGS = ['b', 'i', 'u', 'em', 'strong', 'p', 'br', 'code', 'pre', 'ul', 'ol', 'li']
+
+# Simple keyword->tags dictionary for AI auto-tagging
+AI_TAG_KEYWORDS = {
+    'python': 'python',
+    'flask': 'flask',
+    'javascript': 'javascript',
+    'html': 'html',
+    'css': 'css',
+    'sql': 'sql',
+    'database': 'database',
+    'api': 'api',
+    'socketio': 'socketio',
+    'websocket': 'socketio',
+    'async': 'async',
+    'asyncio': 'async',
+    'linux': 'linux',
+    'git': 'git',
+    'docker': 'docker',
+    'kubernetes': 'kubernetes',
+    'ai': 'ai',
+    'machine learning': 'machine-learning',
+    'deep learning': 'deep-learning',
+    'nlp': 'nlp',
+    'neural network': 'neural-network',
+    'json': 'json',
+    'regex': 'regex',
+    'algorithm': 'algorithm',
+    'data structure': 'data-structure',
+    'html5': 'html',
+    'css3': 'css'
+}
+
+# Helper to auto tag based on keywords in text (case-insensitive)
+def ai_auto_tag(question_text):
+    found_tags = set()
+    lower_text = question_text.lower()
+    for keyword, tag in AI_TAG_KEYWORDS.items():
+        if keyword in lower_text:
+            found_tags.add(tag)
+    return list(found_tags)
+
+@login_manager.user_loader
+def load_user(user_id):
+    return User.query.get(int(user_id))
+
+###################
+# FORMS
+###################
+class RegistrationForm(FlaskForm):
+    username = StringField('Username', validators=[DataRequired(), Length(3,30)])
+    email = StringField('Email', validators=[DataRequired(), Email()])
+    password = PasswordField('Password', validators=[DataRequired(), Length(6,128)])
+    confirm = PasswordField('Confirm Password', validators=[DataRequired(), EqualTo('password')])
+    submit = SubmitField('Register')
+
+class LoginForm(FlaskForm):
+    email = StringField('Email', validators=[DataRequired(), Email()])
+    password = PasswordField('Password', validators=[DataRequired()])
+    submit = SubmitField('Login')
+
+class QuestionForm(FlaskForm):
+    title = StringField('Title', validators=[DataRequired(), Length(10,140)])
+    description = TextAreaField('Description', validators=[DataRequired(), Length(10,1000)])
+    tags = StringField('Tags (comma separated)', validators=[Optional()])
+    anonymous = BooleanField('Post Anonymously')
+    submit = SubmitField('Ask Question')
+
+class AnswerForm(FlaskForm):
+    content = TextAreaField('Your Answer', validators=[DataRequired(), Length(10, 3000)])
+    anonymous = BooleanField('Post Anonymously')
+    submit = SubmitField('Submit Answer')
+
+###################
+# ROUTES
+###################
+
+@app.route('/')
+def index():
+    recent_questions = Question.query.order_by(Question.created_at.desc()).limit(20).all()
+    return render_template('index.html', questions=recent_questions)
+
+@app.route('/register', methods=['GET','POST'])
+def register():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+    form = RegistrationForm()
+    if form.validate_on_submit():
+        if User.query.filter((User.username==form.username.data)|(User.email==form.email.data)).first():
+            flash("Username or email already taken.", "error")
+            return render_template('register.html', form=form)
+        new_user = User(username=form.username.data, email=form.email.data)
+        new_user.set_password(form.password.data)
+        db.session.add(new_user)
+        db.session.commit()
+        flash("Registration successful! Please log in.", "success")
+        return redirect(url_for('login'))
+    return render_template('register.html', form=form)
+
+@app.route('/login', methods=['GET','POST'])
+def login():
+    if current_user.is_authenticated:
+        return redirect(url_for('index'))
+    form = LoginForm()
+    if form.validate_on_submit():
+        user = User.query.filter_by(email=form.email.data).first()
+        if user and user.check_password(form.password.data):
+            login_user(user)
+            flash("Logged in successfully.", "success")
+            return redirect(url_for('index'))
+        else:
+            flash("Invalid email or password.", "error")
+    return render_template('login.html', form=form)
+
+@app.route('/logout')
+@login_required
+def logout():
+    logout_user()
+    flash("Logged out.", "info")
+    return redirect(url_for('index'))
+
+@app.route('/ask', methods=['GET','POST'])
+@login_required
+def ask():
+    form = QuestionForm()
+    if form.validate_on_submit():
+        tags_input = form.tags.data or ''
+        # Parse and clean tags
+        tags_list = [t.strip().lower() for t in tags_input.split(',') if t.strip()]
+        ai_tags = ai_auto_tag(f"{form.title.data} {form.description.data}")
+        final_tags = set(tags_list) | set(ai_tags)
+        tag_objs = []
+        for t in final_tags:
+            tag_obj = Tag.query.filter_by(name=t).first()
+            if not tag_obj:
+                tag_obj = Tag(name=t)
+                db.session.add(tag_obj)
+                db.session.commit()
+            tag_objs.append(tag_obj)
+        q = Question(title=form.title.data,
+                     description=bleach.clean(form.description.data, tags=CLEAN_TAGS, strip=True),
+                     author=current_user,
+                     tags=tag_objs,
+                     anonymous=form.anonymous.data)
+        db.session.add(q)
+        db.session.commit()
+        flash("Question asked successfully!", "success")
+        return redirect(url_for('question_detail', qid=q.id))
+    return render_template('ask.html', form=form)
+
+@app.route('/question/<int:qid>', methods=['GET', 'POST'])
+def question_detail(qid):
+    question = Question.query.get_or_404(qid)
+    form = AnswerForm()
+    if form.validate_on_submit() and current_user.is_authenticated:
+        clean_content = bleach.clean(form.content.data, tags=CLEAN_TAGS + ['span', 'div'], strip=True)
+        answer = Answer(content=clean_content,
+                        question=question,
+                        author=current_user,
+                        anonymous=form.anonymous.data)
+        db.session.add(answer)
+        db.session.commit()
+        flash("Answer posted successfully.", "success")
+        return redirect(url_for('question_detail', qid=qid))
+    return render_template('question.html', question=question, form=form)
+
+@app.route('/user/<username>')
+def profile(username):
+    user = User.query.filter_by(username=username).first_or_404()
+    badges = user.badges.all()
+    return render_template('profile.html', user=user, badges=badges)
+
+##########################
+# Voting APIs
+##########################
+
+@app.route('/vote/question/<int:qid>', methods=['POST'])
+@login_required
+def vote_question(qid):
+    data = request.json
+    is_upvote = data.get('upvote', True)
+    question = Question.query.get_or_404(qid)
+    existing_vote = Vote.query.filter_by(user_id=current_user.id, question_id=qid).first()
+    if existing_vote:
+        # Toggle or change vote
+        if existing_vote.is_upvote == is_upvote:
+            # Remove vote
+            db.session.delete(existing_vote)
+        else:
+            existing_vote.is_upvote = is_upvote
+    else:
+        vote = Vote(user_id=current_user.id, question_id=qid, is_upvote=is_upvote)
+        db.session.add(vote)
+    db.session.commit()
+    # Award badges if applicable
+    award_badges_for_user(current_user)
+    return jsonify({'score': question.vote_score()})
+
+@app.route('/vote/answer/<int:aid>', methods=['POST'])
+@login_required
+def vote_answer(aid):
+    data = request.json
+    is_upvote = data.get('upvote', True)
+    answer = Answer.query.get_or_404(aid)
+    existing_vote = Vote.query.filter_by(user_id=current_user.id, answer_id=aid).first()
+    if existing_vote:
+        if existing_vote.is_upvote == is_upvote:
+            db.session.delete(existing_vote)
+        else:
+            existing_vote.is_upvote = is_upvote
+    else:
+        vote = Vote(user_id=current_user.id, answer_id=aid, is_upvote=is_upvote)
+        db.session.add(vote)
+    db.session.commit()
+    award_badges_for_user(current_user)
+    return jsonify({'score': answer.vote_score()})
+
+@app.route('/answer/<int:aid>/accept', methods=['POST'])
+@login_required
+def accept_answer(aid):
+    answer = Answer.query.get_or_404(aid)
+    question = answer.question
+    if current_user.id != question.user_id:
+        return jsonify({'error': 'Only the question author can accept an answer.'}), 403
+    # Unmark other accepted answers
+    accepted = Answer.query.filter_by(question_id=question.id, is_accepted=True).all()
+    for a in accepted:
+        a.is_accepted = False
+    answer.is_accepted = True
+    db.session.commit()
+    award_badges_for_user(answer.author)
+    return jsonify({'message': 'Answer accepted.'})
+
+##########################
+# AI & Real-time Features (Socket.IO)
+##########################
+
+# Realtime duplicate check: when user types question title, server suggests similar questions
+@socketio.on('check_duplicate')
+def handle_check_duplicate(data):
+    title = data.get('title', '').strip().lower()
+    suggestions = []
+    if title:
+        # simple substring search in titles
+        matches = Question.query.filter(Question.title.ilike(f'%{title}%')).limit(5).all()
+        for m in matches:
+            suggestions.append({'id': m.id, 'title': m.title})
+    emit('duplicate_suggestions', {'suggestions': suggestions})
+
+# Collaborative editing rooms: users join a room per answer id
+@socketio.on('join_answer_room')
+def on_join_answer(data):
+    answer_id = data.get('answer_id')
+    room = f"answer_{answer_id}"
+    join_room(room)
+    answer = Answer.query.get(answer_id)
+    # Send current content to new user joining
+    emit('answer_content', {'content': answer.content or ''}, room=request.sid)
+
+@socketio.on('leave_answer_room')
+def on_leave_answer(data):
+    answer_id = data.get('answer_id')
+    room = f"answer_{answer_id}"
+    leave_room(room)
+
+@socketio.on('answer_edit')
+def on_answer_edit(data):
+    answer_id = data.get('answer_id')
+    content = data.get('content', '')
+    user_id = current_user.get_id() if current_user.is_authenticated else None
+    room = f"answer_{answer_id}"
+    # Sanitize content before saving
+    clean_content = bleach.clean(content, tags=CLEAN_TAGS + ['span', 'div'], strip=True)
+    answer = Answer.query.get(answer_id)
+    if answer:
+        answer.content = clean_content
+        db.session.commit()
+        # Broadcast to other users in the room except sender
+        emit('answer_update', {'content': clean_content}, room=room, include_self=False)
+
+##########################
+# Badge awarding logic
+##########################
+def award_badges_for_user(user):
+    if not user:
+        return
+    # Verify existing badges
+    badges = {b.name for b in user.badges}
+    accepted_answers_count = sum(1 for a in user.answers if a.is_accepted)
+    votes_cast = user.votes.count()
+
+    # Expert badge on 10 accepted answers
+    if accepted_answers_count >= 10 and "Expert Answerer" not in badges:
+        badge = Badge(user=user, name="Expert Answerer", description="Awarded for 10 accepted answers")
+        db.session.add(badge)
+
+    # Voting Champion (50 votes cast)
+    if votes_cast >= 50 and "Voting Champion" not in badges:
+        badge = Badge(user=user, name="Voting Champion", description="For 50 votes cast in community")
+        db.session.add(badge)
+
+    db.session.commit()
+
+##########################
+# Helper Routes for JS to get tags suggestions
+##########################
+
+@app.route('/tags/autocomplete')
+def tags_autocomplete():
+    q = request.args.get("q", "").lower()
+    if not q:
+        return jsonify([])
+    tags = Tag.query.filter(Tag.name.ilike(f'%{q}%')).limit(10).all()
+    return jsonify([tag.name for tag in tags])
+
+##########################
+# Community Fact-checking
+##########################
+
+@app.route('/factcheck/<int:answer_id>', methods=['POST'])
+@login_required
+def add_factcheck(answer_id):
+    data = request.json
+    comment = data.get('comment', '').strip()
+    if not comment:
+        return jsonify({'error': 'Comment required'}), 400
+    fc = FactCheck(answer_id=answer_id, user_id=current_user.id, comment=comment)
+    db.session.add(fc)
+    db.session.commit()
+    return jsonify({'message': 'Fact-check comment added'})
+
+
+##########################
+# Error handlers
+##########################
+@app.errorhandler(404)
+def page_not_found(e):
+    return render_template('404.html'), 404
+
+##########################
+# Context processor for darkmode and user info
+##########################
+@app.context_processor
+def inject_user_and_site():
+    return dict(current_user=current_user)
+
+##########################
+# Run app
+##########################
+
+if __name__ == '__main__':
+    socketio.run(app, host='0.0.0.0', port=5000)
+
+===== run.py =====
+from app import socketio, app
+
+if __name__ == '__main__':
+    socketio.run(app, debug=True, port=5000)
+
+===== templates/base.html =====
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{% block title %}StackIt - Neon Cyberpunk Q&A{% endblock %}</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/highlight.min.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+    <script src="{{ url_for('static', filename='vendor/highlight.min.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/socketio-client.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='js/main.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='js/speech.js') }}" defer></script>
+
+    <meta name="description" content="StackIt Neon Cyberpunk Q&A Platform" />
+</head>
+<body>
+<nav class="navbar">
+    <a href="{{ url_for('index') }}" class="nav-brand">StackIt</a>
+
+    <div class="nav-links">
+    {% if current_user.is_authenticated %}
+        <span class="nav-user">Hi, {{ current_user.username }}</span>
+        <a href="{{ url_for('ask') }}" class="nav-button">Ask Question</a>
+        <a href="{{ url_for('logout') }}" class="nav-button logout">Logout</a>
+    {% else %}
+        <a href="{{ url_for('login') }}" class="nav-button">Login</a>
+        <a href="{{ url_for('register') }}" class="nav-button">Register</a>
+    {% endif %}
+    </div>
+
+    <button aria-label="Toggle dark mode" id="darkModeToggle" class="dark-toggle" title="Toggle Dark Mode">🌙</button>
+</nav>
+
+<main>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            <div class="flash-messages">
+                {% for category, message in messages %}
+                    <div class="flash flash-{{ category }}">{{ message }}</div>
+                {% endfor %}
+            </div>
+        {% endif %}
+    {% endwith %}
+
+    {% block content %}{% endblock %}
+</main>
+
+<footer>
+    <p>StackIt &copy; 2024 - Neon Cyberpunk by AI</p>
+</footer>
+
+<!-- Contextual help tooltips partial -->
+{% include 'help_tooltip.html' %}
+
+</body>
+</html>
+
+===== templates/index.html =====
+{% extends 'base.html' %}
+
+{% block title %}Home - StackIt{% endblock %}
+{% block content %}
+<h1>Latest Questions</h1>
+<div id="questions-list" class="question-list">
+    {% if questions %}
+        {% for q in questions %}
+        <div class="question-card">
+            <div class="question-votes">
+                <button class="vote-btn vote-up" data-qid="{{ q.id }}">▲</button>
+                <div class="vote-score" id="qscore-{{ q.id }}">{{ q.vote_score() }}</div>
+                <button class="vote-btn vote-down" data-qid="{{ q.id }}">▼</button>
+            </div>
+            <div class="question-content">
+                <a href="{{ url_for('question_detail', qid=q.id) }}" class="question-title" title="{{ q.title }}">{{ q.title }}</a>
+                <div class="question-tags">
+                {% for tag in q.tags %}
+                    <span class="tag">{{ tag.name }}</span>
+                {% endfor %}
+                </div>
+                <small class="question-meta">
+                    Asked by {% if q.anonymous %}Anonymous{% else %}<a href="{{ url_for('profile', username=q.author.username) }}">{{ q.author.username }}</a>{% endif %}
+                    on {{ q.created_at.strftime('%b %d, %Y') }}
+                </small>
+            </div>
+        </div>
+        {% else %}
+            <p>No questions yet. Be the first!</p>
+        {% endfor %}
+    {% else %}
+        <p>Loading questions...</p>
+    {% endif %}
+</div>
+{% endblock %}
+
+===== templates/login.html =====
+{% extends 'base.html' %}
+
+{% block title %}Login - StackIt{% endblock %}
+
+{% block content %}
+<h1>Login</h1>
+<form method="POST" action="{{ url_for('login') }}" novalidate>
+    {{ form.hidden_tag() }}
+    <label for="email">Email</label>
+    {{ form.email(class="input-field") }}
+    <label for="password">Password</label>
+    {{ form.password(class="input-field") }}
+    <button type="submit" class="btn-primary">Log In</button>
+</form>
+<p>Don't have an account? <a href="{{ url_for('register') }}">Register here</a>.</p>
+{% endblock %}
+
+===== templates/register.html =====
+{% extends 'base.html' %}
+
+{% block title %}Register - StackIt{% endblock %}
+
+{% block content %}
+<h1>Register</h1>
+<form method="POST" action="{{ url_for('register') }}" novalidate>
+    {{ form.hidden_tag() }}
+    <label for="username">Username</label>
+    {{ form.username(class="input-field") }}
+    <label for="email">Email</label>
+    {{ form.email(class="input-field") }}
+    <label for="password">Password</label>
+    {{ form.password(class="input-field") }}
+    <label for="confirm">Confirm Password</label>
+    {{ form.confirm(class="input-field") }}
+    <button type="submit" class="btn-primary">Register</button>
+</form>
+<p>Already have an account? <a href="{{ url_for('login') }}">Log in</a>.</p>
+{% endblock %}
+
+===== templates/ask.html =====
+{% extends 'base.html' %}
+
+{% block title %}Ask a Question - StackIt{% endblock %}
+
+{% block content %}
+<h1>Ask a Question</h1>
+
+<form method="POST" action="{{ url_for('ask') }}" novalidate id="askQuestionForm">
+    {{ form.hidden_tag() }}
+
+    <label for="title">Title</label>
+    {{ form.title(class="input-field", id="questionTitle") }}
+
+    <div id="duplicate-suggestions" class="duplicate-suggestions" aria-live="polite"></div>
+
+    <label for="description">Description (Markdown allowed with code blocks)</label>
+    {{ form.description(class="textarea-field", id="questionDescription") }}
+
+    <label for="tags">Tags (comma separated) - AI auto-tagging will suggest tags as you type</label>
+    {{ form.tags(class="input-field", id="questionTags") }}
+
+    <label>{{ form.anonymous() }} Post Anonymously</label>
+
+    <button type="button" id="startVoiceInput" class="btn-voice" title="Speak to enter your question description">🎤 Voice Input</button>
+
+    <button type="submit" class="btn-primary">Ask Question</button>
+</form>
+
+<script>
+window.addEventListener('DOMContentLoaded', () => {
+    const titleInput = document.getElementById('questionTitle');
+    const descInput = document.getElementById('questionDescription');
+    const tagsInput = document.getElementById('questionTags');
+    const duplicateSuggestionBox = document.getElementById('duplicate-suggestions');
+    const socket = io();
+
+    // AI Auto-tagging: When title or description changes, update tags
+    function updateTags() {
+        const combined = titleInput.value + ' ' + descInput.value;
+        fetch('/tags/autocomplete?q=' + encodeURIComponent(combined))
+        .then(res => res.json())
+        .then(tags => {
+            // For demo: Replace tags input with AI tags suggestions
+            if(tags.length > 0){
+                tagsInput.value = tags.join(', ');
+            }
+        });
+    }
+    titleInput.addEventListener('input', () => {
+        updateTags();
+
+        // Real-time duplicate question check via SocketIO
+        socket.emit('check_duplicate', {title: titleInput.value});
+    });
+    descInput.addEventListener('input', updateTags);
+
+    // Show duplicate question suggestions
+    socket.on('duplicate_suggestions', data => {
+        const suggestions = data.suggestions;
+        if(suggestions.length > 0 && titleInput.value.trim().length > 5){
+            duplicateSuggestionBox.innerHTML = '<strong>Did you mean:</strong><ul>' +
+                suggestions.map(q => `<li><a href="/question/${q.id}">${q.title}</a></li>`).join('') + '</ul>';
+        } else {
+            duplicateSuggestionBox.innerHTML = '';
+        }
+    });
+
+    // Voice input integration (triggered by speech.js)
+    const btnVoice = document.getElementById('startVoiceInput');
+    btnVoice.addEventListener('click', () => {
+        startVoiceRecognition(descInput);
+    });
+});
+</script>
+
+{% endblock %}
+
+===== templates/question.html =====
+{% extends 'base.html' %}
+
+{% block title %}Question #{{ question.id }} - StackIt{% endblock %}
+
+{% block content %}
+<article class="question-detail">
+    <h1 class="question-title">{{ question.title }}</h1>
+    <div class="question-meta">
+        Asked by {% if question.anonymous %}Anonymous{% else %}<a href="{{ url_for('profile', username=question.author.username) }}">{{ question.author.username }}</a>{% endif %} 
+        on {{ question.created_at.strftime('%b %d, %Y at %H:%M') }}
+    </div>
+    <div class="question-description rich-text">
+        {{ question.description | safe }}
+    </div>
+    <div class="question-tags">
+        {% for tag in question.tags %}
+        <span class="tag">{{ tag.name }}</span>
+        {% endfor %}
+    </div>
+    <div class="question-voting">
+        <button class="vote-btn vote-up" data-qid="{{ question.id }}">▲</button>
+        <span class="vote-score" id="qscore-{{ question.id }}">{{ question.vote_score() }}</span>
+        <button class="vote-btn vote-down" data-qid="{{ question.id }}">▼</button>
+    </div>
+</article>
+
+<section class="answers-section">
+    <h2>Answers</h2>
+    {% if question.answers.count() == 0 %}
+        <p>No answers yet. Be the first to answer!</p>
+    {% endif %}
+
+    <div id="answers-list" class="answers-list">
+        {% for answer in question.answers.order_by(Answer.created_at.asc()).all() %}
+        <article class="answer-card" data-aid="{{ answer.id }}">
+            <div class="answer-content rich-text" id="answer-content-{{ answer.id }}">
+                {{ answer.content|safe }}
+            </div>
+            <div class="answer-meta">
+                Answered by {% if answer.anonymous %}Anonymous{% else %}<a href="{{ url_for('profile', username=answer.author.username) }}">{{ answer.author.username }}</a>{% endif %}
+                 on {{ answer.created_at.strftime('%b %d, %Y at %H:%M') }}
+            </div>
+            <div class="answer-voting">
+                <button class="vote-btn vote-up" data-aid="{{ answer.id }}">▲</button>
+                <span class="vote-score" id="ascore-{{ answer.id }}">{{ answer.vote_score() }}</span>
+                <button class="vote-btn vote-down" data-aid="{{ answer.id }}">▼</button>
+                {% if current_user.is_authenticated and current_user.id == question.user_id %}
+                    {% if not answer.is_accepted %}
+                    <button class="btn-small accept-btn" data-aid="{{ answer.id }}">Accept Answer</button>
+                    {% else %}
+                    <span class="accepted-badge" aria-label="Accepted Answer">✔ Accepted</span>
+                    {% endif %}
+                {% endif %}
+            </div>
+            <div class="answer-factcheck">
+                {% if current_user.is_authenticated %}
+                <button class="btn-small factcheck-btn" data-aid="{{ answer.id }}">Fact-Check</button>
+                {% endif %}
+                <div class="factcheck-comments" id="factcheck-{{ answer.id }}"></div>
+            </div>
+            {% if current_user.is_authenticated %}
+            <div class="answer-editor">
+                <label for="edit-answer-{{ answer.id }}">Live Collaborative Edit:</label>
+                <textarea id="edit-answer-{{ answer.id }}" class="answer-editor-textarea" data-aid="{{ answer.id }}">{{ answer.content }}</textarea>
+            </div>
+            {% endif %}
+        </article>
+        {% endfor %}
+    </div>
+</section>
+
+<section class="answer-submit">
+    {% if current_user.is_authenticated %}
+    <h2>Your Answer</h2>
+    <form id="answerForm" method="POST" novalidate>
+        {{ form.hidden_tag() }}
+        {{ form.content(rows=6, class="textarea-field rich-text-editor") }}
+        <label>{{ form.anonymous() }} Post Anonymously</label>
+        <button type="submit" class="btn-primary">Submit Answer</button>
+    </form>
+    {% else %}
+    <p><a href="{{ url_for('login') }}">Login</a> to post an answer.</p>
+    {% endif %}
+</section>
+
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    // Voting handlers for question
+    document.querySelectorAll('.vote-btn').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            const target = e.target;
+            const qid = target.dataset.qid;
+            const aid = target.dataset.aid;
+            const upvote = target.classList.contains('vote-up');
+
+            let url = '';
+            if(qid) url = `/vote/question/${qid}`;
+            else if(aid) url = `/vote/answer/${aid}`;
+            if(!url) return;
+
+            const resp = await fetch(url, {
+                method: 'POST',
+                body: JSON.stringify({upvote}),
+                headers: {
+                    'Content-Type': 'application/json'
+                }
+            });
+            if(resp.ok){
+                const data = await resp.json();
+                if(qid) document.getElementById(`qscore-${qid}`).textContent = data.score;
+                else if(aid) document.getElementById(`ascore-${aid}`).textContent = data.score;
+            }
+        });
+    });
+
+    // Accept answer buttons
+    document.querySelectorAll('.accept-btn').forEach(btn => {
+        btn.addEventListener('click', async () => {
+            const aid = btn.dataset.aid;
+            const resp = await fetch(`/answer/${aid}/accept`, {method: 'POST'});
+            if(resp.ok){
+                location.reload();
+            } else {
+                alert("Error accepting answer.");
+            }
+        });
+    });
+
+    // Fact-check buttons
+    document.querySelectorAll('.factcheck-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const aid = btn.dataset.aid;
+            const comment = prompt("Add your fact-check comment:");
+            if(comment){
+                fetch(`/factcheck/${aid}`, {
+                    method: 'POST',
+                    body: JSON.stringify({comment}),
+                    headers: {'Content-Type': 'application/json'}
+                }).then(res => res.json()).then(data =>{
+                    alert(data.message);
+                });
+            }
+        });
+    });
+
+    // Answer form submission using AJAX to avoid page reload
+    const answerForm = document.getElementById('answerForm');
+    if(answerForm){
+        answerForm.addEventListener('submit', async e => {
+            e.preventDefault();
+            const formData = new FormData(answerForm);
+            const content = formData.get('content');
+            const anonymous = formData.get('anonymous') === 'y' || formData.get('anonymous')==='on';
+            if(!content || content.length<10){
+                alert("Answer content too short.");
+                return;
+            }
+            const resp = await fetch(location.pathname, {
+                method: 'POST',
+                body: new URLSearchParams({
+                    content: content,
+                    anonymous: anonymous ? 'y' : ''
+                }),
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+            });
+            if(resp.redirected){
+                location.href = resp.url;
+            }
+        });
+    }
+
+    // Live collaborative editing setup
+
+    const socket = io();
+    document.querySelectorAll('.answer-editor-textarea').forEach(textarea => {
+        const aid = textarea.dataset.aid;
+        socket.emit('join_answer_room', {answer_id: aid});
+
+        // Update textarea content from others
+        socket.on('answer_update', data => {
+            if(document.activeElement !== textarea){
+                textarea.value = data.content;
+                // Update rendered HTML
+                const contentDiv = document.getElementById(`answer-content-${aid}`);
+                contentDiv.innerHTML = data.content;
+                // Highlight code blocks dynamically
+                document.querySelectorAll('pre code').forEach((block) => {
+                    hljs.highlightBlock(block);
+                });
+            }
+        });
+
+        // Emit edits on input with debounce
+        let debounceTimer;
+        textarea.addEventListener('input', () => {
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => {
+                socket.emit('answer_edit', {answer_id: aid, content: textarea.value});
+            }, 700);
+        });
+    });
+});
+</script>
+
+{% endblock %}
+
+===== templates/profile.html =====
+{% extends 'base.html' %}
+
+{% block title %}Profile of {{ user.username }} - StackIt{% endblock %}
+{% block content %}
+<h1>Profile: {{ user.username }}</h1>
+<p>Member since: {{ user.created_at.strftime('%b %d, %Y') }}</p>
+
+<h2>Badges</h2>
+{% if badges %}
+<ul class="badges-list">
+    {% for badge in badges %}
+    <li class="badge" title="{{ badge.description }}">{{ badge.name }}</li>
+    {% endfor %}
+</ul>
+{% else %}
+<p>No badges yet.</p>
+{% endif %}
+{% endblock %}
+
+===== templates/help_tooltip.html =====
+<div id="help-tooltip" class="help-tooltip hidden" role="region" aria-live="polite">
+    <p>Welcome to StackIt! Use the neon-powered Q&A platform:</p>
+    <ul>
+        <li>Ask questions with AI auto-tagging</li>
+        <li>See real-time duplicate suggestions</li>
+        <li>Write answers with live collaborative editing</li>
+        <li>Try voice-to-text question input 🎤</li>
+        <li>Earn expert badges for your activity</li>
+    </ul>
+    <button id="tooltipCloseBtn" aria-label="Close help tooltip">Got it!</button>
+</div>
+<script>
+document.addEventListener('DOMContentLoaded', () => {
+    const tooltip = document.getElementById('help-tooltip');
+    const btnClose = document.getElementById('tooltipCloseBtn');
+    if (!localStorage.getItem('helpTooltipDismissed')) {
+        tooltip.classList.remove('hidden');
+    }
+    btnClose.addEventListener('click', () => {
+        tooltip.classList.add('hidden');
+        localStorage.setItem('helpTooltipDismissed', 'true');
+    });
+});
+</script>
+<style>
+.help-tooltip {
+    position: fixed;
+    bottom: 20px;
+    right: 20px;
+    background: #00F5FFdd;
+    color: #0A0A14;
+    padding: 1rem 1.5rem;
+    border-radius: 12px;
+    max-width: 320px;
+    box-shadow: 0 0 15px #FF00E4aa;
+    font-weight: 600;
+    z-index: 9999;
+}
+.help-tooltip.hidden {
+    display: none;
+}
+#tooltipCloseBtn {
+    background: #FF00E4aa;
+    border: none;
+    padding: 5px 10px;
+    cursor: pointer;
+    color: #fff;
+    border-radius: 6px;
+    margin-top: 10px;
+}
+#tooltipCloseBtn:hover {
+    background: #FF00E4ee;
+}
+</style>
+</div>
+
+===== static/css/style.css =====
+/* Neon Cyberpunk Dark Mode Theme */
+:root {
+    --bg-color: #0A0A14;
+    --text-color: #00F5FF;
+    --accent-color: #FF00E4;
+    --nav-bg: #060616;
+    --nav-text: #00F5FF;
+    --btn-bg: #FF00E4;
+    --btn-hover-bg: #00F5FF;
+    --input-bg: #121224;
+    --input-text: #00F5FF;
+    --tag-bg: #0A0A14;
+    --tag-border: #FF00E4;
+}
+
+[data-theme="dark"] {
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+}
+
+body {
+    margin: 0;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+}
+
+a {
+    color: var(--accent-color);
+    text-decoration: none;
+}
+a:hover {
+    text-decoration: underline;
+    color: #00F5FF;
+}
+
+.navbar {
+    background-color: var(--nav-bg);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0 1rem;
+    height: 3.5rem;
+    box-shadow: 0 0 8px var(--btn-bg);
+}
+
+.nav-brand {
+    font-weight: 900;
+    font-size: 1.5rem;
+    text-shadow: 0 0 5px var(--accent-color);
+}
+
+.nav-links a, .nav-user {
+    margin-left: 1rem;
+    font-weight: 600;
+}
+
+.nav-button {
+    border: none;
+    background: var(--btn-bg);
+    color: var(--bg-color);
+    padding: 0.3rem 0.8rem;
+    font-weight: 600;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: background-color 0.3s ease;
+    text-decoration: none;
+    display: inline-block;
+    user-select: none;
+    text-align: center;
+}
+.nav-button:hover {
+    background: var(--btn-hover-bg);
+    color: var(--bg-color);
+}
+.nav-button.logout {
+    background: transparent;
+    color: var(--accent-color);
+}
+.nav-button.logout:hover {
+    color: var(--btn-hover-bg);
+}
+
+.dark-toggle {
+    background: none;
+    border: none;
+    color: var(--accent-color);
+    font-size: 1.4rem;
+    cursor: pointer;
+    filter: drop-shadow(0 0 3px var(--accent-color));
+}
+
+main {
+    flex-grow: 1;
+    padding: 1rem 2rem;
+    max-width: 900px;
+    margin: auto;
+    min-height: 70vh;
+}
+
+h1, h2 {
+    font-weight: 900;
+    text-shadow: 0 0 4px var(--accent-color);
+    margin-bottom: 1rem;
+}
+
+.input-field, .textarea-field {
+    width: 100%;
+    background: var(--input-bg);
+    color: var(--input-text);
+    border: 2px solid var(--accent-color);
+    border-radius: 8px;
+    padding: 0.6rem;
+    font-size: 1rem;
+    font-family: 'Consolas', monospace;
+    box-sizing: border-box;
+    margin-bottom: 1rem;
+    transition: border-color 0.3s ease;
+    outline-offset: 2px;
+}
+.input-field:focus, .textarea-field:focus {
+    border-color: var(--btn-bg);
+    outline: none;
+    box-shadow: 0 0 10px var(--btn-bg);
+}
+
+.btn-primary {
+    background-color: var(--btn-bg);
+    border: none;
+    padding: 0.6rem 1.4rem;
+    color: var(--bg-color);
+    font-weight: 900;
+    text-transform: uppercase;
+    border-radius: 10px;
+    cursor: pointer;
+    filter: drop-shadow(0 0 7px var(--btn-bg));
+    transition: background-color 0.3s ease;
+    user-select: none;
+}
+.btn-primary:hover {
+    background-color: var(--btn-hover-bg);
+}
+
+.btn-small {
+    background-color: var(--accent-color);
+    border: none;
+    color: var(--bg-color);
+    padding: 0.2rem 0.6rem;
+    border-radius: 6px;
+    font-size: 0.8rem;
+    font-weight: 700;
+    cursor: pointer;
+    margin-left: 0.5rem;
+    filter: drop-shadow(0 0 6px var(--accent-color));
+}
+.btn-small:hover {
+    background-color: #FF00E4cc;
+}
+
+.vote-btn {
+    background: transparent;
+    border: none;
+    color: var(--accent-color);
+    cursor: pointer;
+    font-size: 1.2rem;
+    text-shadow: 0 0 8px var(--btn-bg);
+    user-select: none;
+}
+.vote-btn.vote-up:hover {
+    color: var(--btn-bg);
+}
+.vote-btn.vote-down:hover {
+    color: #ff4666;
+}
+
+.vote-score {
+    font-weight: 700;
+    font-size: 1.2rem;
+    margin: 0 0.3rem;
+    user-select: none;
+}
+
+.question-list, .answers-list {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+}
+
+.question-card, .answer-card {
+    background-color: #121224;
+    padding: 1rem 1.2rem;
+    border-radius: 15px;
+    box-shadow: 0 0 10px #00F5FFbb;
+    display: flex;
+    gap: 1rem;
+}
+
+.question-votes, .answer-voting {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    user-select: none;
+}
+
+.question-content {
+    flex-grow: 1;
+}
+
+.question-title {
+    font-size: 1.3rem;
+    font-weight: 800;
+    color: var(--accent-color);
+}
+
+.question-tags, .tags {
+    margin-top: 0.6rem;
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+}
+
+.tag {
+    background-color: transparent;
+    border: 1.6px solid var(--tag-border);
+    border-radius: 18px;
+    padding: 0.15rem 0.6rem;
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--accent-color);
+    text-transform: lowercase;
+    user-select: none;
+}
+
+.question-meta, .answer-meta {
+    font-size: 0.85rem;
+    color: #00F5FFbb;
+    font-style: italic;
+    margin-top: 0.5rem;
+}
+
+.answer-card {
+    flex-direction: column;
+    box-shadow: 0 0 11px #FF00E4bb;
+}
+
+.answer-content {
+    white-space: pre-wrap;
+    font-family: 'Consolas', monospace;
+    font-size: 1rem;
+}
+
+.rich-text pre {
+    background-color: #00060a;
+    padding: 8px;
+    border-radius: 8px;
+    overflow-x: auto;
+    margin: 0.5rem 0;
+}
+
+.rich-text code {
+    font-family: 'Consolas', monospace;
+    background-color: #001e29;
+    color: #00F5FFcc;
+    padding: 2px 6px;
+    border-radius: 4px;
+}
+
+.accepted-badge {
+    background-color: var(--btn-bg);
+    color: var(--bg-color);
+    padding: 0.2rem 0.6rem;
+    border-radius: 10px;
+    font-weight: 700;
+    box-shadow: 0 0 9px var(--btn-bg);
+}
+
+.answer-editor-textarea {
+    background-color: #0F1122;
+    border: 2px solid var(--accent-color);
+    color: var(--text-color);
+    font-family: 'Consolas', monospace;
+    padding: 8px;
+    border-radius: 10px;
+    resize: vertical;
+    width: 100%;
+    min-height: 120px;
+    margin-top: 0.5rem;
+    box-sizing: border-box;
+    filter: drop-shadow(0 0 8px var(--accent-color));
+}
+
+.flash-messages {
+    position: fixed;
+    top: 60px;
+    left: 50%;
+    transform: translateX(-50%);
+    max-width: 400px;
+    z-index: 11000;
+}
+
+.flash {
+    padding: 0.8rem 1rem;
+    margin-bottom: 0.4rem;
+    border-radius: 8px;
+    font-weight: 700;
+    text-align: center;
+    user-select: none;
+}
+.flash-success {
+    background-color: #00efb094;
+    color: #004026;
+    box-shadow: 0 0 10px #00efb0aa;
+}
+.flash-error {
+    background-color: #ff416c8a;
+    color: #330004;
+    box-shadow: 0 0 12px #ff416cbb;
+}
+.flash-info {
+    background-color: #0099ff8c;
+    color: #002233;
+    box-shadow: 0 0 8px #0099ffbb;
+}
+
+.duplicate-suggestions {
+    color: #FF00E4;
+    font-style: italic;
+    margin: 0.2rem 0 1rem 0;
+}
+
+.btn-voice {
+    font-size: 1.1rem;
+    padding: 0.4rem 1rem;
+    margin-bottom: 1.2rem;
+    border-radius: 12px;
+    border: 2px solid var(--accent-color);
+    background: transparent;
+    color: var(--accent-color);
+    cursor: pointer;
+    filter: drop-shadow(0 0 10px var(--accent-color));
+}
+.btn-voice:hover {
+    background: var(--btn-bg);
+    color: var(--bg-color);
+}
+
+footer {
+    text-align: center;
+    padding: 1rem 0;
+    font-size: 0.85rem;
+    color: #00405f;
+    filter: drop-shadow(0 0 4px #FF00E4bb);
+    user-select: none;
+}
+
+/* Responsive */
+@media (max-width: 700px) {
+    main {
+        padding: 1rem;
+    }
+    .question-card, .answer-card {
+        flex-direction: column;
+    }
+    .question-votes, .answer-voting {
+        flex-direction: row;
+        justify-content: flex-start;
+        margin-bottom: 0.5rem;
+    }
+}
+
+===== static/js/socketio-client.js =====
+/* Socket.IO client auto-connect handled by main.js */
+/* Empty file placeholder for any Socket.IO client global setup if needed */
+
+===== static/js/main.js =====
+document.addEventListener('DOMContentLoaded', () => {
+    // Initialize syntax highlighter globally
+    if(window.hljs){
+        document.querySelectorAll('pre code').forEach(block => {
+            hljs.highlightBlock(block);
+        });
+    }
+
+    // Dark mode toggle persisted in localStorage
+    const body = document.querySelector('html');
+    const toggle = document.getElementById('darkModeToggle');
+    if(!localStorage.getItem('stackit-theme')){
+        localStorage.setItem('stackit-theme', 'dark');
+    }
+    body.setAttribute('data-theme', localStorage.getItem('stackit-theme'));
+
+    toggle.addEventListener('click', () => {
+        let current = body.getAttribute('data-theme');
+        let nextTheme = current === 'dark' ? 'light' : 'dark';
+        body.setAttribute('data-theme', nextTheme);
+        localStorage.setItem('stackit-theme', nextTheme);
+    });
+});
+
+===== static/js/speech.js =====
+/**
+ * Web Speech API voice-to-text integration for question description input
+ * Exposes startVoiceRecognition(inputElement) function to start recognition
+ */
+function startVoiceRecognition(inputElement) {
+    if(!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)){
+        alert("Speech Recognition API not supported in this browser.");
+        return;
+    }
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.lang = 'en-US';
+    recognition.interimResults = true;
+
+    recognition.onresult = (event) => {
+        let transcript = '';
+        for(let i=event.resultIndex; i<event.results.length; i++){
+            transcript += event.results[i][0].transcript;
+        }
+        inputElement.value = transcript;
+        inputElement.dispatchEvent(new Event('input'));
+    };
+    recognition.onerror = event => {
+        console.error("Speech recognition error:", event.error);
+        alert("Speech recognition error: " + event.error);
+    };
+    recognition.onend = () => {
+        // Automatically restart recognition for continuous listening
+        if(recognition.running) recognition.start();
+    };
+    recognition.running = true;
+    recognition.start();
+}
+
+window.startVoiceRecognition = startVoiceRecognition;
+
+===== demo_data.py =====
+from app import app, db
+from models import User, Question, Answer, Tag, Badge
+from datetime import datetime, timedelta
+
+with app.app_context():
+    db.drop_all()
+    db.create_all()
+
+    # Create demo users
+    alice = User(username='alice', email='alice@example.com')
+    alice.set_password('password1')
+    bob = User(username='bob', email='bob@example.com')
+    bob.set_password('password2')
+    charlie = User(username='charlie', email='charlie@example.com')
+    charlie.set_password('password3')
+    db.session.add_all([alice, bob, charlie])
+    db.session.commit()
+
+    # Tags
+    tags = ['python', 'flask', 'javascript', 'sql', 'api', 'socketio', 'ai', 'machine-learning', 'html', 'css']
+    tag_objs = []
+    for t in tags:
+        tag_obj = Tag(name=t)
+        db.session.add(tag_obj)
+        tag_objs.append(tag_obj)
+    db.session.commit()
+
+    # Questions
+    q1 = Question(title="How to implement WebSocket in Flask?",
+                  description="I want to implement **real-time** communication in Flask apps. How can I use Socket.IO effectively?",
+                  author=alice,
+                  tags=[tag_objs[1], tag_objs[5]],  # flask, socketio
+                  anonymous=False,
+                  created_at=datetime.utcnow() - timedelta(days=1))
+    q2 = Question(title="Python AI auto-tagging implementation",
+                  description="What is a simple way to add AI-based auto-tagging using NLP techniques?",
+                  author=bob,
+                  tags=[tag_objs[0], tag_objs[6]],
+                  anonymous=False,
+                  created_at=datetime.utcnow() - timedelta(days=2))
+    db.session.add_all([q1, q2])
+    db.session.commit()
+
+    # Answers
+    a1 = Answer(content="You can use the Flask-SocketIO extension. It makes WebSocket integration seamless.", question=q1, author=bob)
+    a2 = Answer(content="Simple keyword matching or pre-trained models can be used for auto-tagging.", question=q2, author=charlie, is_accepted=True)
+    db.session.add_all([a1, a2])
+    db.session.commit()
+
+    # Badges for demo
+    badge1 = Badge(user=alice, name="Expert Answerer", description="Awarded for 10 accepted answers")
+    badge2 = Badge(user=bob, name="Voting Champion", description="For 50 votes cast in community")
+    db.session.add_all([badge1, badge2])
+    db.session.commit()
+
+    print("Demo data inserted successfully.")
